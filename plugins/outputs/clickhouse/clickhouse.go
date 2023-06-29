@@ -150,7 +150,7 @@ func quoteIdent(name string) string {
 	return `"` + strings.ReplaceAll(sanitizeQuoted(name), `"`, `""`) + `"`
 }
 
-func (ch *ClickHouse) valueToDatatype(value interface{}) string {
+func (ch *ClickHouse) toDatatype(value interface{}) string {
 	var datatype string
 
 	switch value.(type) {
@@ -174,7 +174,7 @@ func (ch *ClickHouse) valueToDatatype(value interface{}) string {
 	return datatype
 }
 
-func (ch *ClickHouse) toNullableType(pair *orderedmap.Pair[string, string]) string {
+func (ch *ClickHouse) toNullable(pair *orderedmap.Pair[string, string]) string {
 	if pair.Key != "host" && pair.Key != ch.TimestampColumn && pair.Key != "measurement" {
 		return fmt.Sprintf("Nullable(%s)", pair.Value)
 	}
@@ -184,7 +184,7 @@ func (ch *ClickHouse) toNullableType(pair *orderedmap.Pair[string, string]) stri
 func (ch *ClickHouse) generateCreateTable(tablename string, columns *orderedmap.OrderedMap[string, string]) string {
 	columnDefs := make([]string, 0, columns.Len())
 	for pair := columns.Oldest(); pair != nil; pair = pair.Next() {
-		columnDefs = append(columnDefs, fmt.Sprintf("%s %s", quoteIdent(pair.Key), ch.toNullableType(pair)))
+		columnDefs = append(columnDefs, fmt.Sprintf("%s %s", quoteIdent(pair.Key), ch.toNullable(pair)))
 	}
 
 	orderBy := make([]string, 0, 3)
@@ -214,7 +214,7 @@ func (ch *ClickHouse) generateAlterTable(tablename string, columns *orderedmap.O
 	modifyDefs := make([]string, 0, columns.Len())
 
 	for pair := columns.Oldest(); pair != nil; pair = pair.Next() {
-		columnType := ch.toNullableType(pair)
+		columnType := ch.toNullable(pair)
 
 		alterDefs = append(alterDefs, fmt.Sprintf("ADD COLUMN IF NOT EXISTS %s %s",
 			quoteIdent(pair.Key),
@@ -270,7 +270,7 @@ func (ch *ClickHouse) ensureTable(tablename string, columns *orderedmap.OrderedM
 	}
 
 	for pair := columns.Oldest(); pair != nil; pair = pair.Next() {
-		if _, ok := tableColumns[pair.Key]; !ok || tableColumns[pair.Key] != ch.toNullableType(pair) {
+		if _, ok := tableColumns[pair.Key]; !ok || tableColumns[pair.Key] != ch.toNullable(pair) {
 			_, err = ch.db.Exec(ch.generateAlterTable(tablename, columns))
 			if err != nil {
 				return err
@@ -367,16 +367,16 @@ func (ch *ClickHouse) WriteMultiTable(metrics []telegraf.Metric) error {
 		metricEntry := make(map[string]interface{})
 
 		metricEntry[ch.TimestampColumn] = metric.Time()
-		columns[tablename].Set(ch.TimestampColumn, ch.valueToDatatype(metric.Time()))
+		columns[tablename].Set(ch.TimestampColumn, ch.toDatatype(metric.Time()))
 
 		for _, tag := range metric.TagList() {
 			metricEntry[tag.Key] = tag.Value
-			columns[tablename].Set(tag.Key, ch.valueToDatatype(tag.Value))
+			columns[tablename].Set(tag.Key, ch.toDatatype(tag.Value))
 		}
 
 		for _, field := range metric.FieldList() {
 			metricEntry[field.Key] = field.Value
-			columns[tablename].Set(field.Key, ch.valueToDatatype(field.Value))
+			columns[tablename].Set(field.Key, ch.toDatatype(field.Value))
 		}
 
 		metricsData[tablename] = append(metricsData[tablename], metricEntry)
@@ -406,21 +406,21 @@ func (ch *ClickHouse) WriteSingleTable(metrics []telegraf.Metric) error {
 
 		metricEntry := make(map[string]interface{})
 		metricEntry[ch.TimestampColumn] = metric.Time()
-		columns.Set(ch.TimestampColumn, ch.valueToDatatype(metric.Time()))
+		columns.Set(ch.TimestampColumn, ch.toDatatype(metric.Time()))
 
 		metricEntry["measurement"] = metricName
-		columns.Set("measurement", ch.valueToDatatype(metricName))
+		columns.Set("measurement", ch.toDatatype(metricName))
 
 		for _, tag := range metric.TagList() {
 			colName := fmt.Sprintf("%s_%s", metricName, tag.Key)
 			metricEntry[colName] = tag.Value
-			columns.Set(colName, ch.valueToDatatype(tag.Value))
+			columns.Set(colName, ch.toDatatype(tag.Value))
 		}
 
 		for _, field := range metric.FieldList() {
 			colName := fmt.Sprintf("%s_%s", metricName, field.Key)
 			metricEntry[colName] = field.Value
-			columns.Set(colName, ch.valueToDatatype(field.Value))
+			columns.Set(colName, ch.toDatatype(field.Value))
 		}
 
 		metricsData = append(metricsData, metricEntry)
