@@ -36,9 +36,9 @@ type ClickHouse struct {
 	TableMode             string             `toml:"table_mode"`
 	SingleTableOptions    SingleTableOptions `toml:"single_table"`
 	MultiTableOptions     MultiTableOptions  `toml:"multi_table"`
-	QueueSize             int                `toml:"queue_size"`
-	QueueLimit            int                `toml:"queue_limit"`
-	FlushInterval         time.Duration      `toml:"flush_interval"`
+	QueueInitialSize      int                `toml:"queue_initial_size"`
+	QueueMaxSize          int                `toml:"queue_max_size"`
+	QueueFlushInterval    time.Duration      `toml:"queue_flush_interval"`
 	ConnectionMaxIdleTime time.Duration      `toml:"connection_max_idle_time"`
 	ConnectionMaxLifetime time.Duration      `toml:"connection_max_lifetime"`
 	ConnectionMaxIdle     int                `toml:"connection_max_idle"`
@@ -77,25 +77,25 @@ func (ch *ClickHouse) Init() error {
 		ch.Log.Info("table_name is not set, using default value: ", ch.SingleTableOptions.TableName)
 	}
 
-	if ch.QueueSize <= 0 {
-		ch.QueueSize = 100000
-		ch.Log.Info("queue_size is not set, using default value: ", ch.QueueSize)
+	if ch.QueueInitialSize <= 0 {
+		ch.QueueInitialSize = 100000
+		ch.Log.Info("queue_initial_size is not set, using default value: ", ch.QueueInitialSize)
 	}
 
-	if ch.QueueLimit <= 0 {
-		ch.QueueLimit = int(math.MaxUint64 >> 1)
-		ch.Log.Info("queue_limit is not set, using default value: ", ch.QueueLimit)
+	if ch.QueueMaxSize <= 0 {
+		ch.QueueMaxSize = int(math.MaxUint64 >> 1)
+		ch.Log.Info("queue_max_size is not set, using default value: ", ch.QueueMaxSize)
 	}
 
-	if ch.FlushInterval <= 0 {
-		ch.FlushInterval = 5 * time.Second
-		ch.Log.Info("flush_interval is not set, using default value: ", ch.FlushInterval)
+	if ch.QueueFlushInterval <= 0 {
+		ch.QueueFlushInterval = 1 * time.Second
+		ch.Log.Info("queue_flush_interval is not set, using default value: ", ch.QueueFlushInterval)
 	}
 
-	ch.metricQueue = make([]telegraf.Metric, 0, ch.QueueSize)
+	ch.metricQueue = make([]telegraf.Metric, 0, ch.QueueInitialSize)
 	ch.metricTrigger = make(chan struct{}, 1)
 
-	go ch.backgroundWriter(ch.FlushInterval)
+	go ch.backgroundWriter(ch.QueueFlushInterval)
 
 	return nil
 }
@@ -439,8 +439,8 @@ func (ch *ClickHouse) WriteSingleTable(metrics []telegraf.Metric) error {
 
 func (ch *ClickHouse) Write(metrics []telegraf.Metric) error {
 	ch.metricLock.Lock()
-	if len(ch.metricQueue) >= ch.QueueLimit {
-		ch.Log.Errorf("Metrics queue is full (%d/%d), dropping metrics", len(ch.metricQueue), ch.QueueLimit)
+	if len(ch.metricQueue) >= ch.QueueMaxSize {
+		ch.Log.Errorf("Metrics queue is full (%d/%d), dropping metrics", len(ch.metricQueue), ch.QueueMaxSize)
 	} else {
 		ch.metricQueue = append(ch.metricQueue, metrics...)
 	}
