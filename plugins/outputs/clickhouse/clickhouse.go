@@ -18,13 +18,26 @@ import (
 //go:embed sample.conf
 var sampleConfig string
 
+type SingleTableOptions struct {
+	TableName string `toml:"table_name"`
+}
+
+type MultiTableOptions struct {
+	TablePrefix string `toml:"table_prefix"`
+}
+
 type ClickHouse struct {
-	DataSourceName        string          `toml:"data_source_name"`
-	InitSQL               string          `toml:"init_sql"`
-	ConnectionMaxIdleTime config.Duration `toml:"connection_max_idle_time"`
-	ConnectionMaxLifetime config.Duration `toml:"connection_max_lifetime"`
-	ConnectionMaxIdle     int             `toml:"connection_max_idle"`
-	ConnectionMaxOpen     int             `toml:"connection_max_open"`
+	DataSourceName        string             `toml:"data_source_name"`
+	InitSQL               string             `toml:"init_sql"`
+	TimestampColumn       string             `toml:"timestamp_column"`
+	TTL                   string             `toml:"ttl"`
+	TableMode             string             `toml:"table_mode"`
+	SingleTableOptions    SingleTableOptions `toml:"single_table"`
+	MultiTableOptions     MultiTableOptions  `toml:"multi_table"`
+	ConnectionMaxIdleTime config.Duration    `toml:"connection_max_idle_time"`
+	ConnectionMaxLifetime config.Duration    `toml:"connection_max_lifetime"`
+	ConnectionMaxIdle     int                `toml:"connection_max_idle"`
+	ConnectionMaxOpen     int                `toml:"connection_max_open"`
 
 	db  *gosql.DB
 	Log telegraf.Logger `toml:"-"`
@@ -32,6 +45,30 @@ type ClickHouse struct {
 
 func (*ClickHouse) SampleConfig() string {
 	return sampleConfig
+}
+
+func (p *ClickHouse) Init() error {
+	if p.DataSourceName == "" {
+		return fmt.Errorf("data_source_name is a required configuration option")
+	}
+
+	if p.TimestampColumn == "" {
+		fmt.Println("timestamp_column is not set, using default value: timestamp")
+		p.TimestampColumn = "timestamp"
+	}
+
+	if p.TableMode == "" {
+		fmt.Println("table_mode is not set, using default value: single")
+		p.TableMode = "single"
+	} else if p.TableMode != "single" && p.TableMode != "multi" {
+		return fmt.Errorf("table_mode must be one of: single, multi")
+	}
+
+	if p.TableMode == "single" && p.SingleTableOptions.TableName == "" {
+		p.SingleTableOptions.TableName = "telegraf"
+	}
+
+	return nil
 }
 
 func (p *ClickHouse) Connect() error {
@@ -58,7 +95,6 @@ func (p *ClickHouse) Connect() error {
 	}
 
 	p.db = db
-
 	fmt.Println("Connected to ClickHouse!")
 
 	return nil
@@ -113,14 +149,30 @@ func (p *ClickHouse) deriveDatatype(value interface{}) string {
 
 func (p *ClickHouse) generateCreateTable(tablename string, columns []string, datatypes map[string]string) string {
 	columnDefs := make([]string, 0, len(columns))
-
 	for _, column := range columns {
 		columnDefs = append(columnDefs, fmt.Sprintf("%s %s", quoteIdent(column), datatypes[column]))
 	}
 
-	return fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s) ENGINE = MergeTree() ORDER BY (host,timestamp) PARTITION BY toYYYYMM(timestamp) TTL timestamp + INTERVAL 3 MONTH",
+	orderBy := make([]string, 0, len(columns))
+	if _, ok := datatypes["host"]; ok {
+		orderBy = append(orderBy, "host")
+	}
+	orderBy = append(orderBy, quoteIdent(p.TimestampColumn))
+	if _, ok := datatypes["measurement"]; ok {
+		orderBy = append(orderBy, "measurement")
+	}
+
+	createTable := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s) ENGINE = MergeTree() ORDER BY (%s) PARTITION BY toYYYYMM(%s)",
 		quoteIdent(tablename),
-		strings.Join(columnDefs, ","))
+		strings.Join(columnDefs, ","),
+		strings.Join(orderBy, ","),
+		quoteIdent(p.TimestampColumn))
+
+	if p.TTL != "" {
+		createTable += fmt.Sprintf(" TTL %s + INTERVAL %s", quoteIdent(p.TimestampColumn), p.TTL)
+	}
+
+	return createTable
 }
 
 func (p *ClickHouse) generateAlterTable(tablename string, columns []string, datatypes map[string]string) string {
