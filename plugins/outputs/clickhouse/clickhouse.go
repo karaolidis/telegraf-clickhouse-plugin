@@ -95,7 +95,7 @@ func (ch *ClickHouse) Init() error {
 	ch.metricQueue = make([]telegraf.Metric, 0, ch.QueueSize)
 	ch.metricTrigger = make(chan struct{}, 1)
 
-	go ch.metricWriter(ch.FlushInterval)
+	go ch.backgroundWriter(ch.FlushInterval)
 
 	return nil
 }
@@ -172,11 +172,6 @@ func (ch *ClickHouse) valueToDatatype(value interface{}) string {
 	}
 
 	return datatype
-}
-
-type NullUint64 struct {
-	Uint64 uint64
-	Valid  bool
 }
 
 func (ch *ClickHouse) generateCreateTable(tablename string, columns *orderedmap.OrderedMap[string, string]) string {
@@ -460,7 +455,7 @@ func (ch *ClickHouse) Write(metrics []telegraf.Metric) error {
 	return nil
 }
 
-func (ch *ClickHouse) metricWriter(delay time.Duration) {
+func (ch *ClickHouse) backgroundWriter(delay time.Duration) {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 
