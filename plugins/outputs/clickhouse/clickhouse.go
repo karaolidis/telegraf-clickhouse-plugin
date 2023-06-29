@@ -13,6 +13,7 @@ import (
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/plugins/outputs"
+	"github.com/wk8/go-ordered-map/v2"
 )
 
 //go:embed sample.conf
@@ -104,15 +105,9 @@ func (p *ClickHouse) Close() error {
 	return p.db.Close()
 }
 
-func quoteIdent(name string) string {
-	return `"` + strings.ReplaceAll(sanitizeQuoted(name), `"`, `""`) + `"`
-}
-
 func sanitizeQuoted(in string) string {
 	// https://dev.mysql.com/doc/refman/8.0/en/identifiers.html
 	// https://www.postgresql.org/docs/13/sql-syntax-lexical.html#SQL-SYNTAX-IDENTIFIERS
-
-	// Whitelist allowed characters
 	return strings.Map(func(r rune) rune {
 		switch {
 		case r >= '\u0001' && r <= '\uFFFF':
@@ -121,6 +116,10 @@ func sanitizeQuoted(in string) string {
 			return '_'
 		}
 	}, in)
+}
+
+func quoteIdent(name string) string {
+	return `"` + strings.ReplaceAll(sanitizeQuoted(name), `"`, `""`) + `"`
 }
 
 func (p *ClickHouse) deriveDatatype(value interface{}) string {
@@ -147,18 +146,19 @@ func (p *ClickHouse) deriveDatatype(value interface{}) string {
 	return datatype
 }
 
-func (p *ClickHouse) generateCreateTable(tablename string, columns []string, datatypes map[string]string) string {
-	columnDefs := make([]string, 0, len(columns))
-	for _, column := range columns {
-		columnDefs = append(columnDefs, fmt.Sprintf("%s %s", quoteIdent(column), datatypes[column]))
+func (p *ClickHouse) generateCreateTable(tablename string, columns *orderedmap.OrderedMap[string, string]) string {
+	columnDefs := make([]string, 0, columns.Len())
+
+	for pair := columns.Oldest(); pair != nil; pair = pair.Next() {
+		columnDefs = append(columnDefs, fmt.Sprintf("%s %s", quoteIdent(pair.Key), pair.Value))
 	}
 
-	orderBy := make([]string, 0, len(columns))
-	if _, ok := datatypes["host"]; ok {
+	orderBy := make([]string, 0, 3)
+	if _, ok := columns.Get("host"); ok {
 		orderBy = append(orderBy, "host")
 	}
 	orderBy = append(orderBy, quoteIdent(p.TimestampColumn))
-	if _, ok := datatypes["measurement"]; ok {
+	if _, ok := columns.Get("measurement"); ok {
 		orderBy = append(orderBy, "measurement")
 	}
 
@@ -175,12 +175,13 @@ func (p *ClickHouse) generateCreateTable(tablename string, columns []string, dat
 	return createTable
 }
 
-func (p *ClickHouse) generateAlterTable(tablename string, columns []string, datatypes map[string]string) string {
-	alterDefs := make([]string, 0, len(columns))
+func (p *ClickHouse) generateAlterTable(tablename string, columns *orderedmap.OrderedMap[string, string]) string {
+	alterDefs := make([]string, 0, columns.Len())
 
-	for _, column := range columns {
+	for pair := columns.Oldest(); pair != nil; pair = pair.Next() {
 		alterDefs = append(alterDefs, fmt.Sprintf("ADD COLUMN IF NOT EXISTS %s %s",
-			quoteIdent(column), datatypes[column]))
+			quoteIdent(pair.Key),
+			pair.Value))
 	}
 
 	return fmt.Sprintf("ALTER TABLE %s %s",
@@ -188,13 +189,64 @@ func (p *ClickHouse) generateAlterTable(tablename string, columns []string, data
 		strings.Join(alterDefs, ","))
 }
 
-func (p *ClickHouse) generateInsert(tablename string, columns []string, batchSize int) string {
-	quotedColumns := make([]string, 0, len(columns))
-	for _, column := range columns {
-		quotedColumns = append(quotedColumns, quoteIdent(column))
+func (p *ClickHouse) ensureTable(tablename string, columns *orderedmap.OrderedMap[string, string]) error {
+	var res *gosql.Rows
+	var err error
+
+	for {
+		res, err = p.db.Query(fmt.Sprintf("DESCRIBE TABLE %s", quoteIdent(tablename)))
+
+		if err != nil {
+			// Unknown Table Error
+			if strings.Contains(err.Error(), "code: 60") {
+				_, err = p.db.Exec(p.generateCreateTable(tablename, columns))
+				if err != nil {
+					return err
+				}
+				fmt.Println("Created table", tablename)
+				continue
+			}
+			return err
+		}
+
+		defer res.Close()
+		break
 	}
 
-	placeholder := "(" + strings.Repeat("?,", len(columns)-1) + "?)"
+	tableColumns := make(map[string]struct{})
+	for res.Next() {
+		var name string
+		var _i string
+
+		err = res.Scan(&name, &_i, &_i, &_i, &_i, &_i, &_i)
+		if err != nil {
+			return err
+		}
+
+		tableColumns[name] = struct{}{}
+	}
+
+	for pair := columns.Oldest(); pair != nil; pair = pair.Next() {
+		if _, ok := tableColumns[pair.Key]; !ok {
+			_, err = p.db.Exec(p.generateAlterTable(tablename, columns))
+			if err != nil {
+				return err
+			}
+			fmt.Println("Altered table", tablename)
+			break
+		}
+	}
+
+	return nil
+}
+
+func (p *ClickHouse) generateInsert(tablename string, columns *orderedmap.OrderedMap[string, string], batchSize int) string {
+	quotedColumns := make([]string, 0, columns.Len())
+	for pair := columns.Oldest(); pair != nil; pair = pair.Next() {
+		quotedColumns = append(quotedColumns, quoteIdent(pair.Key))
+	}
+
+	placeholder := "(" + strings.Repeat("?,", columns.Len()-1) + "?)"
 	placeholders := strings.Repeat(placeholder+",", batchSize-1) + placeholder
 
 	return fmt.Sprintf("INSERT INTO %s(%s) VALUES %s",
@@ -203,121 +255,94 @@ func (p *ClickHouse) generateInsert(tablename string, columns []string, batchSiz
 		placeholders)
 }
 
-func (p *ClickHouse) isUnknownTableErr(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	return strings.Contains(err.Error(), "code: 60")
-}
-
-func (p *ClickHouse) isNoSuchColumnInTableErr(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	return strings.Contains(err.Error(), "code: 16")
-}
-
-func (p *ClickHouse) Write(metrics []telegraf.Metric) error {
+func (p *ClickHouse) WriteMultiTable(metrics []telegraf.Metric) error {
 	metricsByTable := make(map[string][]map[string]interface{})
-	columDatatypes := make(map[string]map[string]string)
-	tableColumns := make(map[string][]string)
-	tableLengths := make(map[string]int)
+	columns := make(map[string]*orderedmap.OrderedMap[string, string])
 
 	for _, metric := range metrics {
 		tablename := metric.Name()
+
+		if p.MultiTableOptions.TablePrefix != "" {
+			tablename = p.MultiTableOptions.TablePrefix + "_" + tablename
+		}
 
 		if _, ok := metricsByTable[tablename]; !ok {
 			metricsByTable[tablename] = make([]map[string]interface{}, 0, len(metrics))
 		}
 
-		if _, ok := columDatatypes[tablename]; !ok {
-			columDatatypes[tablename] = make(map[string]string)
-			tableColumns[tablename] = make([]string, 0, len(metric.FieldList())+len(metric.TagList())+1)
-		}
-
-		if _, ok := tableLengths[tablename]; !ok {
-			tableLengths[tablename] = 0
+		if _, ok := columns[tablename]; !ok {
+			columns[tablename] = orderedmap.New[string, string](len(metrics))
 		}
 
 		metricEntry := make(map[string]interface{})
 
-		metricEntry["timestamp"] = metric.Time()
-		columDatatypes[tablename]["timestamp"] = p.deriveDatatype(metric.Time())
-		tableColumns[tablename] = append(tableColumns[tablename], "timestamp")
+		metricEntry[p.TimestampColumn] = metric.Time()
+		columns[tablename].Set(p.TimestampColumn, p.deriveDatatype(metric.Time()))
 
 		for _, tag := range metric.TagList() {
 			metricEntry[tag.Key] = tag.Value
-			columDatatypes[tablename][tag.Key] = p.deriveDatatype(tag.Value)
-			tableColumns[tablename] = append(tableColumns[tablename], tag.Key)
+			columns[tablename].Set(tag.Key, p.deriveDatatype(tag.Value))
 		}
 
 		for _, field := range metric.FieldList() {
 			metricEntry[field.Key] = field.Value
-			columDatatypes[tablename][field.Key] = p.deriveDatatype(field.Value)
-			tableColumns[tablename] = append(tableColumns[tablename], field.Key)
+			columns[tablename].Set(field.Key, p.deriveDatatype(field.Value))
 		}
 
 		metricsByTable[tablename] = append(metricsByTable[tablename], metricEntry)
-		tableLengths[tablename]++
 	}
 
 	for tablename, metrics := range metricsByTable {
-		for {
-			sql := p.generateInsert(tablename, tableColumns[tablename], tableLengths[tablename])
-			values := make([]interface{}, 0, tableLengths[tablename]*len(columDatatypes[tablename]))
+		err := p.ensureTable(tablename, columns[tablename])
+		if err != nil {
+			return err
+		}
 
-			tx, err := p.db.Begin()
-			if err != nil {
-				return fmt.Errorf("begin failed: %w", err)
+		sql := p.generateInsert(tablename, columns[tablename], len(metrics))
+		values := make([]interface{}, 0, len(metrics)*columns[tablename].Len())
+
+		tx, err := p.db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin failed: %w", err)
+		}
+
+		stmt, err := tx.Prepare(sql)
+		if err != nil {
+			return fmt.Errorf("prepare failed: %w", err)
+		}
+		defer stmt.Close()
+
+		for _, metric := range metrics {
+			for pair := columns[tablename].Oldest(); pair != nil; pair = pair.Next() {
+				values = append(values, metric[pair.Key])
 			}
+		}
 
-			stmt, err := tx.Prepare(sql)
-			if err != nil {
-				if p.isUnknownTableErr(err) {
-					createTableStmt := p.generateCreateTable(tablename, tableColumns[tablename], columDatatypes[tablename])
+		_, err = stmt.Exec(values...)
+		if err != nil {
+			return fmt.Errorf("exec failed: %w", err)
+		}
 
-					_, err = p.db.Exec(createTableStmt)
-					if err != nil {
-						return fmt.Errorf("CREATE TABLE failed: %w", err)
-					}
-					continue
-				}
-
-				if p.isNoSuchColumnInTableErr(err) {
-					alterTableStmt := p.generateAlterTable(tablename, tableColumns[tablename], columDatatypes[tablename])
-					_, err = p.db.Exec(alterTableStmt)
-					if err != nil {
-						return fmt.Errorf("ALTER TABLE failed: %w", err)
-					}
-					continue
-				}
-
-				return fmt.Errorf("prepare failed: %w", err)
-			}
-			defer stmt.Close()
-
-			for _, metric := range metrics {
-				for _, column := range tableColumns[tablename] {
-					values = append(values, metric[column])
-				}
-			}
-
-			_, err = stmt.Exec(values...)
-			if err != nil {
-				return fmt.Errorf("exec failed: %w", err)
-			}
-
-			err = tx.Commit()
-			if err != nil {
-				return fmt.Errorf("commit failed: %w", err)
-			}
-
-			break
+		err = tx.Commit()
+		if err != nil {
+			return fmt.Errorf("commit failed: %w", err)
 		}
 	}
+
 	return nil
+}
+
+func (p *ClickHouse) WriteSingleTable(metrics []telegraf.Metric) error {
+	// TODO
+	return nil
+}
+
+func (p *ClickHouse) Write(metrics []telegraf.Metric) error {
+	if p.TableMode == "single" {
+		return p.WriteSingleTable(metrics)
+	}
+
+	return p.WriteMultiTable(metrics)
 }
 
 func init() {
