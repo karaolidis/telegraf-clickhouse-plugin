@@ -2,10 +2,6 @@
 
 The ClickHouse output plugin saves Telegraf metric data to a ClickHouse database.
 
-The plugin uses a simple, hard-coded database schema. There is a table for each metric type and the table name is the metric name. There is a column per field and a column per tag. There is an optional column for the metric timestamp.
-
-A row is written for every input metric. This means multiple metrics are never merged into a single row, even if they have the same metric name, tags, and timestamp.
-
 The plugin uses Golang's generic "database/sql" interface and third party drivers.
 
 ## Getting started
