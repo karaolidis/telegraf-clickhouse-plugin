@@ -38,6 +38,7 @@ type ClickHouse struct {
 	MultiTableOptions     MultiTableOptions  `toml:"multi_table"`
 	QueueInitialSize      int                `toml:"queue_initial_size"`
 	QueueMaxSize          int                `toml:"queue_max_size"`
+	QueueFlushSize        int                `toml:"queue_flush_size"`
 	QueueFlushInterval    time.Duration      `toml:"queue_flush_interval"`
 	ConnectionMaxIdleTime time.Duration      `toml:"connection_max_idle_time"`
 	ConnectionMaxLifetime time.Duration      `toml:"connection_max_lifetime"`
@@ -85,6 +86,11 @@ func (ch *ClickHouse) Init() error {
 	if ch.QueueMaxSize <= 0 {
 		ch.QueueMaxSize = int(math.MaxUint64 >> 1)
 		ch.Log.Info("queue_max_size is not set, using default value: ", ch.QueueMaxSize)
+	}
+
+	if ch.QueueFlushSize <= 0 {
+		ch.QueueFlushSize = int(math.MaxUint64 >> 1)
+		ch.Log.Info("queue_flush_size is not set, using default value: ", ch.QueueFlushSize)
 	}
 
 	if ch.QueueFlushInterval <= 0 {
@@ -333,9 +339,6 @@ func (ch *ClickHouse) writeMetrics(tablename string, columns *orderedmap.Ordered
 			return fmt.Errorf("exec failed: %w", err)
 		}
 	}
-	if err != nil {
-		return fmt.Errorf("exec failed: %w", err)
-	}
 
 	err = tx.Commit()
 	if err != nil {
@@ -483,10 +486,16 @@ func (ch *ClickHouse) backgroundWriter(delay time.Duration) {
 			timer.Reset(delay)
 
 		case <-ch.metricTrigger:
-			if !timer.Stop() {
-				<-timer.C
+			ch.metricLock.Lock()
+			metricsLength := len(ch.metricQueue)
+			ch.metricLock.Unlock()
+
+			if metricsLength < ch.QueueFlushSize {
+				if !timer.Stop() {
+					<-timer.C
+				}
+				timer.Reset(delay)
 			}
-			timer.Reset(delay)
 		}
 	}
 }
